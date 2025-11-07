@@ -1,0 +1,28 @@
+name: Zip files when PR is merged
+
+on:
+  pull_request:
+    types:
+      - closed
+    branches:
+      - main  # or "master" or whichever branch you merge into
+
+jobs:
+  zip_on_merge:
+    if: github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Show current working directory
+        run: pwd
+
+      - name: List files in current directory
+        run: ls -la
+
+      - name: Create ZIP file from current directory
+        run: |
+          zip -r repo_backup.zip ./
+          echo "ZIP file created successfully!"
