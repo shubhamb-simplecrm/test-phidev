@@ -46,33 +46,37 @@ jobs:
           echo "Changed files from PR:"
           sed -n '1,1000p' changed_files.txt || true
 
-      - name: Create ZIP(s) for changed files under deployments/**
+      - name: Create ZIP(s) keeping original path in filename
         shell: bash
         run: |
           set -euo pipefail
           shopt -s globstar nullglob
-          mkdir -p artifacts
           count=0
+
           if [ -f changed_files.txt ]; then
             while IFS= read -r f || [ -n "$f" ]; do
               [ -z "$f" ] && continue
-              # only consider files under deployments/
+
+              # only process files under deployments/
               if [[ "$f" == deployments/** ]]; then
-                # ensure file exists in workspace; if not, try to extract it from the merge commit
+                # ensure file exists in workspace; if not, extract from merge commit
                 if [ ! -f "$f" ]; then
                   if [ -n "${{ github.event.pull_request.merge_commit_sha }}" ]; then
                     mkdir -p "$(dirname "$f")"
                     git show "${{ github.event.pull_request.merge_commit_sha }}:${f}" > "$f" || true
                   fi
                 fi
+
                 if [ -f "$f" ]; then
-                  echo "Zipping file: $f"
-                  safe_name=$(echo "$f" | sed 's/[^A-Za-z0-9._-]/_/g')
-                  zip_path="artifacts/${safe_name}.zip"
+                  echo "Creating zip for: $f"
+                  # create zip file next to the file, e.g. deployments/crmv267/custom/modules/ztest-1.txt.zip
+                  zip_path="${f}.zip"
+                  mkdir -p "$(dirname "$zip_path")"
+                  # include only the single file (no parent directories inside the zip)
                   zip -j "$zip_path" "$f"
                   count=$((count+1))
                 else
-                  echo "Skipping $f (file not found)"
+                  echo "Skipping (not found): $f"
                 fi
               else
                 echo "Skipping (not under deployments/): $f"
@@ -81,10 +85,12 @@ jobs:
           else
             echo "No changed_files.txt found, nothing to zip."
           fi
-          echo "Created $count zip(s) in artifacts/"
 
-      - name: Upload all created zips as artifact
+          echo "Created $count zip(s) (zip files are placed next to original files)."
+
+      - name: Upload created zip files (preserve repo path inside artifact)
         uses: actions/upload-artifact@v4
         with:
           name: deployment-zip-artifacts
-          path: artifacts/*.zip
+          path: |
+            deployments/**/*.zip
