@@ -1,4 +1,4 @@
-name: Zip files when PR is merged
+name: Zip changed deployment files on PR merge
 
 on:
   pull_request:
@@ -9,20 +9,30 @@ jobs:
   zip_on_merge:
     if: ${{ github.event.pull_request.merged == true }}
     runs-on: ubuntu-latest
-
+    outputs:
+      zips: ${{ steps:set_zips.outputs.zips }}
     steps:
-      - name: Checkout code
+      - name: Checkout repo (full)
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: If merge commit exists, checkout merge commit
+        run: |
+          if [ -n "${{ github.event.pull_request.merge_commit_sha }}" ]; then
+            echo "Checking out merge commit ${{ github.event.pull_request.merge_commit_sha }}"
+            git fetch --no-tags origin ${{ github.event.pull_request.merge_commit_sha }}
+            git checkout ${{ github.event.pull_request.merge_commit_sha }}
+          else
+            echo "No merge_commit_sha; staying on checked-out ref"
+          fi
 
       - name: Get list of files changed in the PR
         uses: actions/github-script@v6
         with:
           script: |
             const pr = context.payload.pull_request;
-            if (!pr) {
-              core.setFailed('No pull_request found in the event context');
-              return;
-            }
+            if (!pr) core.setFailed('No pull_request found in the event context');
             const files = await github.paginate(github.rest.pulls.listFiles, {
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -35,38 +45,98 @@ jobs:
       - name: Show changed files
         run: |
           echo "Changed files from PR:"
-          sed -n '1,200p' changed_files.txt || true
+          sed -n '1,1000p' changed_files.txt || true
 
-      - name: Create ZIP(s) for deployments/*/custom/modules/*.txt changed files
+      - name: Create ZIP(s) for any changed file under deployments/**
+        id: create_zips
+        shell: bash
         run: |
           set -euo pipefail
-          created=0
+          shopt -s globstar nullglob
+          mkdir -p artifacts
+          zips=()
           if [ -f changed_files.txt ]; then
             while IFS= read -r f || [ -n "$f" ]; do
               [ -z "$f" ] && continue
-              if [[ "$f" == deployments/*/custom/modules/*.txt ]]; then
-                echo "Zipping file: $f"
-                # create zip file next to the file; e.g. deployments/crmv267/custom/modules/ztest-1.txt.zip
-                zip_path="${f}.zip"
-                # ensure directory exists (should already)
-                mkdir -p "$(dirname "$f")"
-                # create zip containing the single file (preserve relative path inside zip if needed)
-                zip -j "$zip_path" "$f"
-                created=$((created+1))
+              # only consider files under deployments/
+              if [[ "$f" == deployments/** ]]; then
+                # ensure parent dir exists locally; if not, try to extract file from commit
+                if [ ! -f "$f" ]; then
+                  echo "File $f not present in workspace, attempting git show from merge commit..."
+                  if [ -n "${{ github.event.pull_request.merge_commit_sha }}" ]; then
+                    mkdir -p "$(dirname "$f")"
+                    git show ${{ github.event.pull_request.merge_commit_sha }}:"$f" > "$f" || true
+                  fi
+                fi
+                if [ -f "$f" ]; then
+                  echo "Zipping file: $f"
+                  safe_name=$(echo "$f" | sed 's/[^A-Za-z0-9._-]/_/g')
+                  zip_path="artifacts/${safe_name}.zip"
+                  # include only the single file inside the zip (no parent directories)
+                  zip -j "$zip_path" "$f"
+                  zips+=("$zip_path")
+                else
+                  echo "Skipping $f (file not found)"
+                fi
               else
-                echo "Skipping (not a module txt file): $f"
+                echo "Skipping (not under deployments/): $f"
               fi
             done < changed_files.txt
           else
             echo "No changed_files.txt found, nothing to zip."
           fi
-          echo "Created $created zip(s) in repo."
+          # write zips list (JSON) to a temporary file for next step to set output
+          python - <<'PY'
+import json,sys,os
+zips = os.environ.get("ZIPS_LIST")
+if not zips:
+    # fallback: read artifacts dir
+    import glob
+    arr = glob.glob("artifacts/*.zip")
+else:
+    arr = zips.split()
+print(json.dumps(arr))
+PY
+        env:
+          ZIPS_LIST: ''
 
-        shell: bash
+      - name: Set zips output
+        id: set_zips
+        run: |
+          # produce JSON array of zip paths
+          python - <<'PY' > zips.json
+import glob, json
+arr = sorted(glob.glob("artifacts/*.zip"))
+print(json.dumps(arr))
+PY
+          echo "zips<<EOF" >> $GITHUB_OUTPUT
+          cat zips.json >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: Upload module zip artifact(s)
+  upload_each_zip:
+    needs: zip_on_merge
+    runs-on: ubuntu-latest
+    if: ${{ needs.zip_on_merge.outputs.zips != '[]' }}
+    strategy:
+      matrix:
+        zip: ${{ fromJson(needs.zip_on_merge.outputs.zips) }}
+    steps:
+      - name: Checkout (to access artifact files)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure artifacts directory present
+        run: ls -la artifacts || true
+
+      - name: Set artifact name
+        id: setname
+        run: |
+          name=$(basename "${{ matrix.zip }}")
+          echo "name=$name" >> $GITHUB_OUTPUT
+
+      - name: Upload single zip as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: module-zip-artifacts
-          path: |
-            deployments/**/custom/modules/*.zip
+          name: ${{ steps.setname.outputs.name }}
+          path: ${{ matrix.zip }}
