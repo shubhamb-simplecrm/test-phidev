@@ -2,27 +2,71 @@ name: Zip files when PR is merged
 
 on:
   pull_request:
-    types:
-      - closed
-    branches:
-      - main  # or "master" or whichever branch you merge into
+    types: [closed]
+    branches: [main]
 
 jobs:
   zip_on_merge:
-    if: github.event.pull_request.merged == true
+    if: ${{ github.event.pull_request.merged == true }}
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Show current working directory
-        run: pwd
+      - name: Get list of files changed in the PR
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const pr = context.payload.pull_request;
+            if (!pr) {
+              core.setFailed('No pull_request found in the event context');
+              return;
+            }
+            const files = await github.paginate(github.rest.pulls.listFiles, {
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              pull_number: pr.number
+            });
+            const paths = files.map(f => f.filename).join('\n');
+            require('fs').writeFileSync('changed_files.txt', paths);
+            core.info(`Wrote ${files.length} changed paths to changed_files.txt`);
 
-      - name: List files in current directory
-        run: ls -la
-
-      - name: Create ZIP file from current directory
+      - name: Show changed files
         run: |
-          zip -r repo_backup.zip ./
-          echo "ZIP file created successfully!"
+          echo "Changed files from PR:"
+          sed -n '1,200p' changed_files.txt || true
+
+      - name: Create ZIP(s) for deployments/*/custom/modules/*.txt changed files
+        run: |
+          set -euo pipefail
+          created=0
+          if [ -f changed_files.txt ]; then
+            while IFS= read -r f || [ -n "$f" ]; do
+              [ -z "$f" ] && continue
+              if [[ "$f" == deployments/*/custom/modules/*.txt ]]; then
+                echo "Zipping file: $f"
+                # create zip file next to the file; e.g. deployments/crmv267/custom/modules/ztest-1.txt.zip
+                zip_path="${f}.zip"
+                # ensure directory exists (should already)
+                mkdir -p "$(dirname "$f")"
+                # create zip containing the single file (preserve relative path inside zip if needed)
+                zip -j "$zip_path" "$f"
+                created=$((created+1))
+              else
+                echo "Skipping (not a module txt file): $f"
+              fi
+            done < changed_files.txt
+          else
+            echo "No changed_files.txt found, nothing to zip."
+          fi
+          echo "Created $created zip(s) in repo."
+
+        shell: bash
+
+      - name: Upload module zip artifact(s)
+        uses: actions/upload-artifact@v4
+        with:
+          name: module-zip-artifacts
+          path: |
+            deployments/**/custom/modules/*.zip
