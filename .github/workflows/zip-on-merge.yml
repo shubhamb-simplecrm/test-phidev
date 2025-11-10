@@ -9,8 +9,7 @@ jobs:
   zip_on_merge:
     if: ${{ github.event.pull_request.merged == true }}
     runs-on: ubuntu-latest
-    outputs:
-      zips: ${{ steps:set_zips.outputs.zips }}
+
     steps:
       - name: Checkout repo (full)
         uses: actions/checkout@v4
@@ -47,34 +46,31 @@ jobs:
           echo "Changed files from PR:"
           sed -n '1,1000p' changed_files.txt || true
 
-      - name: Create ZIP(s) for any changed file under deployments/**
-        id: create_zips
+      - name: Create ZIP(s) for changed files under deployments/**
         shell: bash
         run: |
           set -euo pipefail
           shopt -s globstar nullglob
           mkdir -p artifacts
-          zips=()
+          count=0
           if [ -f changed_files.txt ]; then
             while IFS= read -r f || [ -n "$f" ]; do
               [ -z "$f" ] && continue
               # only consider files under deployments/
               if [[ "$f" == deployments/** ]]; then
-                # ensure parent dir exists locally; if not, try to extract file from commit
+                # ensure file exists in workspace; if not, try to extract it from the merge commit
                 if [ ! -f "$f" ]; then
-                  echo "File $f not present in workspace, attempting git show from merge commit..."
                   if [ -n "${{ github.event.pull_request.merge_commit_sha }}" ]; then
                     mkdir -p "$(dirname "$f")"
-                    git show ${{ github.event.pull_request.merge_commit_sha }}:"$f" > "$f" || true
+                    git show "${{ github.event.pull_request.merge_commit_sha }}:${f}" > "$f" || true
                   fi
                 fi
                 if [ -f "$f" ]; then
                   echo "Zipping file: $f"
                   safe_name=$(echo "$f" | sed 's/[^A-Za-z0-9._-]/_/g')
                   zip_path="artifacts/${safe_name}.zip"
-                  # include only the single file inside the zip (no parent directories)
                   zip -j "$zip_path" "$f"
-                  zips+=("$zip_path")
+                  count=$((count+1))
                 else
                   echo "Skipping $f (file not found)"
                 fi
@@ -85,58 +81,10 @@ jobs:
           else
             echo "No changed_files.txt found, nothing to zip."
           fi
-          # write zips list (JSON) to a temporary file for next step to set output
-          python - <<'PY'
-import json,sys,os
-zips = os.environ.get("ZIPS_LIST")
-if not zips:
-    # fallback: read artifacts dir
-    import glob
-    arr = glob.glob("artifacts/*.zip")
-else:
-    arr = zips.split()
-print(json.dumps(arr))
-PY
-        env:
-          ZIPS_LIST: ''
+          echo "Created $count zip(s) in artifacts/"
 
-      - name: Set zips output
-        id: set_zips
-        run: |
-          # produce JSON array of zip paths
-          python - <<'PY' > zips.json
-import glob, json
-arr = sorted(glob.glob("artifacts/*.zip"))
-print(json.dumps(arr))
-PY
-          echo "zips<<EOF" >> $GITHUB_OUTPUT
-          cat zips.json >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-  upload_each_zip:
-    needs: zip_on_merge
-    runs-on: ubuntu-latest
-    if: ${{ needs.zip_on_merge.outputs.zips != '[]' }}
-    strategy:
-      matrix:
-        zip: ${{ fromJson(needs.zip_on_merge.outputs.zips) }}
-    steps:
-      - name: Checkout (to access artifact files)
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: Ensure artifacts directory present
-        run: ls -la artifacts || true
-
-      - name: Set artifact name
-        id: setname
-        run: |
-          name=$(basename "${{ matrix.zip }}")
-          echo "name=$name" >> $GITHUB_OUTPUT
-
-      - name: Upload single zip as artifact
+      - name: Upload all created zips as artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ steps.setname.outputs.name }}
-          path: ${{ matrix.zip }}
+          name: deployment-zip-artifacts
+          path: artifacts/*.zip
