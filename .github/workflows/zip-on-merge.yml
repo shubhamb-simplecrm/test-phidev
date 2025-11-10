@@ -46,18 +46,18 @@ jobs:
           echo "Changed files from PR:"
           sed -n '1,1000p' changed_files.txt || true
 
-      - name: Create ZIP(s) keeping original path in filename
+      - name: Create ZIP(s) for changed files under deployments/**
         shell: bash
         run: |
           set -euo pipefail
           shopt -s globstar nullglob
+          mkdir -p artifacts
           count=0
 
           if [ -f changed_files.txt ]; then
             while IFS= read -r f || [ -n "$f" ]; do
               [ -z "$f" ] && continue
 
-              # only process files under deployments/
               if [[ "$f" == deployments/** ]]; then
                 # ensure file exists in workspace; if not, extract from merge commit
                 if [ ! -f "$f" ]; then
@@ -69,8 +69,9 @@ jobs:
 
                 if [ -f "$f" ]; then
                   echo "Creating zip for: $f"
-                  # create zip file next to the file, e.g. deployments/crmv267/custom/modules/ztest-1.txt.zip
-                  zip_path="${f}.zip"
+                  # safe artifact name: replace path separators with _
+                  safe_name=$(echo "$f" | sed 's#[/\\]#_#g')
+                  zip_path="artifacts/${safe_name}.zip"
                   mkdir -p "$(dirname "$zip_path")"
                   # include only the single file (no parent directories inside the zip)
                   zip -j "$zip_path" "$f"
@@ -86,11 +87,34 @@ jobs:
             echo "No changed_files.txt found, nothing to zip."
           fi
 
-          echo "Created $count zip(s) (zip files are placed next to original files)."
+          echo "Created $count zip(s) in artifacts/"
 
-      - name: Upload created zip files (preserve repo path inside artifact)
+      - name: Upload created zip files as GitHub artifact (optional)
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: deployment-zip-artifacts
-          path: |
-            deployments/**/*.zip
+          path: artifacts/*.zip
+
+      - name: Authenticate to GCP
+        uses: google-github-actions/setup-gcloud@v1
+        with:
+          service_account_key: ${{ secrets.GCP_SA_KEY }}
+          project_id: ${{ secrets.GCP_PROJECT }}
+
+      - name: Upload created zips to GCS
+        shell: bash
+        env:
+          GCS_BUCKET: temp-bucket-phi
+        run: |
+          # destination path (you can change to any prefix)
+          DST="gs://${GCS_BUCKET}/${{ github.run_id }}/"
+          echo "Uploading artifacts/*.zip -> $DST"
+          # list files and upload; skip if none found
+          ls -la artifacts || true
+          if compgen -G "artifacts/*.zip" > /dev/null; then
+            gsutil -m cp artifacts/*.zip "${DST}"
+            echo "Upload finished"
+          else
+            echo "No zip files to upload"
+          fi
