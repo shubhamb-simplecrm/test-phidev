@@ -36,25 +36,44 @@ jobs:
             });
             require('fs').writeFileSync('changed_files.txt', files.map(f => f.filename).join('\n'));
 
-      - name: Create ZIP(s) for changed files under deployments/**
+      - name: Create ZIP(s) for changed files starting from crmv267/
         shell: bash
         run: |
           set -euo pipefail
-          shopt -s globstar nullglob
           mkdir -p artifacts
           count=0
           if [ -f changed_files.txt ]; then
             while IFS= read -r f || [ -n "$f" ]; do
               [ -z "$f" ] && continue
+              
+              # Only consider files under deployments/
               if [[ "$f" == deployments/** ]]; then
+                # Check if file exists, else try restoring from merge commit
                 if [ ! -f "$f" ] && [ -n "${{ github.event.pull_request.merge_commit_sha }}" ]; then
                   mkdir -p "$(dirname "$f")"
                   git show "${{ github.event.pull_request.merge_commit_sha }}:${f}" > "$f" || true
                 fi
+
+                # Ensure it exists before zipping
                 if [ -f "$f" ]; then
-                  safe_name=$(echo "$f" | sed 's#[/\\]#_#g')
-                  zip -j "artifacts/${safe_name}.zip" "$f"
-                  count=$((count+1))
+                  # Find path starting from 'crmv267'
+                  relpath=$(echo "$f" | sed -n 's#.*\(crmv267/.*\)#\1#p')
+                  
+                  if [ -n "$relpath" ]; then
+                    # Create temp directory structure preserving path
+                    mkdir -p "tempdir/$(dirname "$relpath")"
+                    cp "$f" "tempdir/$relpath"
+
+                    # Zip preserving internal structure
+                    zip_path="artifacts/${relpath//\//_}.zip"
+                    (cd tempdir && zip -r "../$zip_path" "crmv267")
+
+                    rm -rf tempdir
+                    echo "Zipped $relpath -> $zip_path"
+                    count=$((count+1))
+                  else
+                    echo "Skipping $f (no crmv267 in path)"
+                  fi
                 fi
               fi
             done < changed_files.txt
@@ -85,8 +104,7 @@ jobs:
           gcloud auth list --format="value(account)" || true
           echo "gcloud project:"
           gcloud config get-value project || true
-          echo "GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-<not-set>}"
-          echo "Attempt bucket list (may show permission error if SA lacks access):"
+          echo "Attempting bucket list:"
           gsutil ls gs://${{ secrets.GCS_BUCKET }} || true
 
       - name: Upload created zips to GCS
@@ -96,7 +114,6 @@ jobs:
         run: |
           DST="gs://${GCS_BUCKET}/${{ github.run_id }}/"
           echo "Uploading artifacts/*.zip -> $DST"
-          ls -la artifacts || true
           if compgen -G "artifacts/*.zip" > /dev/null; then
             gsutil -m cp artifacts/*.zip "${DST}"
             echo "Upload finished"
