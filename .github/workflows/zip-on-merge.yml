@@ -19,11 +19,8 @@ jobs:
       - name: If merge commit exists, checkout merge commit
         run: |
           if [ -n "${{ github.event.pull_request.merge_commit_sha }}" ]; then
-            echo "Checking out merge commit ${{ github.event.pull_request.merge_commit_sha }}"
             git fetch --no-tags origin ${{ github.event.pull_request.merge_commit_sha }}
             git checkout ${{ github.event.pull_request.merge_commit_sha }}
-          else
-            echo "No merge_commit_sha; staying on checked-out ref"
           fi
 
       - name: Get list of files changed in the PR
@@ -37,14 +34,7 @@ jobs:
               repo: context.repo.repo,
               pull_number: pr.number
             });
-            const paths = files.map(f => f.filename).join('\n');
-            require('fs').writeFileSync('changed_files.txt', paths);
-            core.info(`Wrote ${files.length} changed paths to changed_files.txt`);
-
-      - name: Show changed files
-        run: |
-          echo "Changed files from PR:"
-          sed -n '1,1000p' changed_files.txt || true
+            require('fs').writeFileSync('changed_files.txt', files.map(f => f.filename).join('\n'));
 
       - name: Create ZIP(s) for changed files under deployments/**
         shell: bash
@@ -53,40 +43,22 @@ jobs:
           shopt -s globstar nullglob
           mkdir -p artifacts
           count=0
-
           if [ -f changed_files.txt ]; then
             while IFS= read -r f || [ -n "$f" ]; do
               [ -z "$f" ] && continue
-
               if [[ "$f" == deployments/** ]]; then
-                # ensure file exists in workspace; if not, extract from merge commit
-                if [ ! -f "$f" ]; then
-                  if [ -n "${{ github.event.pull_request.merge_commit_sha }}" ]; then
-                    mkdir -p "$(dirname "$f")"
-                    git show "${{ github.event.pull_request.merge_commit_sha }}:${f}" > "$f" || true
-                  fi
+                if [ ! -f "$f" ] && [ -n "${{ github.event.pull_request.merge_commit_sha }}" ]; then
+                  mkdir -p "$(dirname "$f")"
+                  git show "${{ github.event.pull_request.merge_commit_sha }}:${f}" > "$f" || true
                 fi
-
                 if [ -f "$f" ]; then
-                  echo "Creating zip for: $f"
-                  # safe artifact name: replace path separators with _
                   safe_name=$(echo "$f" | sed 's#[/\\]#_#g')
-                  zip_path="artifacts/${safe_name}.zip"
-                  mkdir -p "$(dirname "$zip_path")"
-                  # include only the single file (no parent directories inside the zip)
-                  zip -j "$zip_path" "$f"
+                  zip -j "artifacts/${safe_name}.zip" "$f"
                   count=$((count+1))
-                else
-                  echo "Skipping (not found): $f"
                 fi
-              else
-                echo "Skipping (not under deployments/): $f"
               fi
             done < changed_files.txt
-          else
-            echo "No changed_files.txt found, nothing to zip."
           fi
-
           echo "Created $count zip(s) in artifacts/"
 
       - name: Upload created zip files as GitHub artifact (optional)
@@ -96,21 +68,34 @@ jobs:
           name: deployment-zip-artifacts
           path: artifacts/*.zip
 
-      - name: Authenticate to GCP
+      - name: Authenticate to GCP (use repo secret)
+        uses: google-github-actions/auth@v1
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY1 }}
+
+      - name: Setup gcloud and export ADC
         uses: google-github-actions/setup-gcloud@v1
         with:
-          service_account_key: ${{ secrets.GCP_SA_KEY }}
           project_id: ${{ secrets.GCP_PROJECT }}
+          export_default_credentials: true
+
+      - name: Debug GCP auth and bucket access
+        run: |
+          echo "gcloud active account:"
+          gcloud auth list --format="value(account)" || true
+          echo "gcloud project:"
+          gcloud config get-value project || true
+          echo "GOOGLE_APPLICATION_CREDENTIALS: ${GOOGLE_APPLICATION_CREDENTIALS:-<not-set>}"
+          echo "Attempt bucket list (may show permission error if SA lacks access):"
+          gsutil ls gs://${{ secrets.GCS_BUCKET }} || true
 
       - name: Upload created zips to GCS
         shell: bash
         env:
-          GCS_BUCKET: temp-bucket-phi
+          GCS_BUCKET: ${{ secrets.GCS_BUCKET }}
         run: |
-          # destination path (you can change to any prefix)
           DST="gs://${GCS_BUCKET}/${{ github.run_id }}/"
           echo "Uploading artifacts/*.zip -> $DST"
-          # list files and upload; skip if none found
           ls -la artifacts || true
           if compgen -G "artifacts/*.zip" > /dev/null; then
             gsutil -m cp artifacts/*.zip "${DST}"
